@@ -1,5 +1,6 @@
 use crate::buffer::{BufReaderWithPos, BufWriterWithPos};
 use crate::command::Command;
+use crate::engines::KvsEngine;
 use crate::{KvsError, Result};
 use serde_json::Deserializer;
 use std::collections::{BTreeMap, HashMap};
@@ -18,7 +19,7 @@ const COMPACTION_THRESHOLD: u64 = 1024 * 1024;
 /// A `BTreeMap` in memory stores the keys and the value locations for fast query.
 ///
 /// ```rust
-/// # use kvs::{KvStore, Result};
+/// # use kvs::{KvStore, Result, KvsEngine};
 /// # fn try_main() -> Result<()> {
 /// use std::env::current_dir;
 /// let mut store = KvStore::open(current_dir()?)?;
@@ -76,84 +77,6 @@ impl KvStore {
         })
     }
 
-    /// Sets the value of a string key to a string.
-    ///
-    /// If the key already exists, the previous value will be overwritten.
-    ///
-    /// # Errors
-    ///
-    /// It propagates I/O or serialization errors during writing the log.
-    pub fn set(&mut self, key: String, value: String) -> Result<()> {
-        let cmd = Command::set(key, value);
-        let pos = self.buf_writer.pos;
-        serde_json::to_writer(&mut self.buf_writer, &cmd)?;
-        self.buf_writer.flush()?;
-        if let Command::Set { key, .. } = cmd {
-            if let Some(old_cmd) = self
-                .index
-                .insert(key, (self.current_log_id, pos..self.buf_writer.pos).into())
-            {
-                self.uncompacted += old_cmd.len;
-            }
-        }
-
-        if self.uncompacted > COMPACTION_THRESHOLD {
-            self.compact()?;
-        }
-        Ok(())
-    }
-
-    /// Gets the string value of a given string key.
-    ///
-    /// Returns `None` if the given key does not exist.
-    ///
-    /// # Errors
-    ///
-    /// It returns `KvsError::UnexpectedCommandType` if the given command type unexpected.
-    pub fn get(&mut self, key: String) -> Result<Option<String>> {
-        if let Some(value_pos) = self.index.get(&key) {
-            let buf_reader = self
-                .buf_readers
-                .get_mut(&value_pos.log_id)
-                .expect("Cannot find log reader");
-            buf_reader.seek(SeekFrom::Start(value_pos.start))?;
-            let cmd_reader = buf_reader.take(value_pos.len);
-            if let Command::Set { value, .. } = serde_json::from_reader(cmd_reader)? {
-                Ok(Some(value))
-            } else {
-                Err(KvsError::UnexpectedCommandType)
-            }
-        } else {
-            Ok(None)
-        }
-    }
-
-    /// Removes a given key.
-    ///
-    /// # Errors
-    ///
-    /// It returns `KvsError::KeyNotFound` if the given key is not found.
-    ///
-    /// It propagates I/O or serialization errors during writing the log.
-    pub fn remove(&mut self, key: String) -> Result<()> {
-        if let Some(pos) = self.index.remove(&key) {
-            self.uncompacted += pos.len;
-            let pos = self.buf_writer.pos;
-            let cmd = Command::remove(key);
-            serde_json::to_writer(&mut self.buf_writer, &cmd)?;
-            self.buf_writer.flush()?;
-
-            self.uncompacted += self.buf_writer.pos - pos;
-
-            if self.uncompacted > COMPACTION_THRESHOLD {
-                self.compact()?;
-            }
-            Ok(())
-        } else {
-            Err(KvsError::KeyNotFound)
-        }
-    }
-
     /// Clears stale entries in the log.
     fn compact(&mut self) -> Result<()> {
         let compact_log_id = self.current_log_id + 1;
@@ -199,6 +122,86 @@ impl KvStore {
             BufReaderWithPos::new(File::open(log_path(&self.path, self.current_log_id))?)?,
         );
         Ok(())
+    }
+}
+
+impl KvsEngine for KvStore {
+    /// Sets the value of a string key to a string.
+    ///
+    /// If the key already exists, the previous value will be overwritten.
+    ///
+    /// # Errors
+    ///
+    /// It propagates I/O or serialization errors during writing the log.
+    fn set(&mut self, key: String, value: String) -> Result<()> {
+        let cmd = Command::set(key, value);
+        let pos = self.buf_writer.pos;
+        serde_json::to_writer(&mut self.buf_writer, &cmd)?;
+        self.buf_writer.flush()?;
+        if let Command::Set { key, .. } = cmd {
+            if let Some(old_cmd) = self
+                .index
+                .insert(key, (self.current_log_id, pos..self.buf_writer.pos).into())
+            {
+                self.uncompacted += old_cmd.len;
+            }
+        }
+
+        if self.uncompacted > COMPACTION_THRESHOLD {
+            self.compact()?;
+        }
+        Ok(())
+    }
+
+    /// Gets the string value of a given string key.
+    ///
+    /// Returns `None` if the given key does not exist.
+    ///
+    /// # Errors
+    ///
+    /// It returns `KvsError::UnexpectedCommandType` if the given command type unexpected.
+    fn get(&mut self, key: String) -> Result<Option<String>> {
+        if let Some(value_pos) = self.index.get(&key) {
+            let buf_reader = self
+                .buf_readers
+                .get_mut(&value_pos.log_id)
+                .expect("Cannot find log reader");
+            buf_reader.seek(SeekFrom::Start(value_pos.start))?;
+            let cmd_reader = buf_reader.take(value_pos.len);
+            if let Command::Set { value, .. } = serde_json::from_reader(cmd_reader)? {
+                Ok(Some(value))
+            } else {
+                Err(KvsError::UnexpectedCommandType)
+            }
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Removes a given key.
+    ///
+    /// # Errors
+    ///
+    /// It returns `KvsError::KeyNotFound` if the given key is not found.
+    ///
+    /// It propagates I/O or serialization errors during writing the log.
+    fn remove(&mut self, key: String) -> Result<()> {
+        if let Some(pos) = self.index.remove(&key) {
+            self.uncompacted += pos.len;
+            let pos = self.buf_writer.pos;
+            let cmd = Command::remove(key);
+            serde_json::to_writer(&mut self.buf_writer, &cmd)?;
+            self.buf_writer.flush()?;
+
+            self.uncompacted += self.buf_writer.pos - pos;
+
+            if self.uncompacted > COMPACTION_THRESHOLD {
+                self.compact()?;
+            }
+            Ok(())
+        } else {
+            Err(KvsError::KeyNotFound)
+        }
     }
 }
 
